@@ -49,6 +49,20 @@ try:
 except (ImportError, IOError, AttributeError):
     HAS_XFORMERS = False
 
+# [Optional] MSLK triton_splitk backend (from MSLK-NV repo, with int64 fix)
+# This replaces the broken conda xformers triton_splitk
+HAS_MSLK_SPLITK = True
+try:
+    from mslk.ops.attention.triton_splitk import FwOp as MslkTritonSplitkFwOp, get_splitk_4x
+    from mslk.ops.attention import attn_bias as mslk_attn_bias
+except (ImportError, IOError, AttributeError) as e:
+    HAS_MSLK_SPLITK = False
+    MslkTritonSplitkFwOp = None
+    get_splitk_4x = None
+    mslk_attn_bias = None
+    import logging
+    logging.warning(f"Failed to import mslk triton_splitk: {e}")
+
 try:
     import mslk.attention.gqa_attn_splitk  # noqa: F401
     from gen_ai.llm_inference.fb.llm.quantization.kv_quantize import quantize_kv_fp8
@@ -73,10 +87,10 @@ try:
 except (ImportError, IOError, AttributeError):
     HAS_AITER = False
 
-# [Optional] cutlass_blackwell_fmha backend
+# [Optional] cutlass_blackwell_fmha backend from FBGEMM
 HAS_CUTLASS_BLACKWELL = True
 try:
-    from mslk.attention.cutlass_blackwell_fmha import (
+    from fbgemm_gpu.experimental.gen_ai.attention.cutlass_blackwell_fmha import (
         cutlass_blackwell_fmha_interface as blackwell,
     )
 
@@ -94,6 +108,17 @@ try:
 except (ImportError, IOError, AttributeError):
     HAS_FLASH_CUTE = False
     flash_attn_cute_func = None  # Define it as None to avoid NameError
+
+# [Optional] MSLK cute-DSL decode backend (Blackwell optimized)
+HAS_MSLK_DECODE = True
+try:
+    from mslk.attention.flash_attn.interface import mslk_flash_attn_decode
+    assert mslk_flash_attn_decode is not None, "mslk_flash_attn_decode import returned None"
+except (ImportError, IOError, AttributeError) as e:
+    HAS_MSLK_DECODE = False
+    mslk_flash_attn_decode = None
+    import logging
+    logging.warning(f"Failed to import mslk_flash_attn_decode: {e}")
 
 
 def parse_op_args(args: List[str]):
@@ -139,14 +164,14 @@ class _Shape:
 
 def _generate_shapes():
     # llama4 128e: head_q = 5
-    HEAD_Q = 5
-    HEAD_KV = 1
-    HEAD_D = 128
-    max_len_kv = 32768
+    HEAD_Q = 64
+    HEAD_KV = 8
+    HEAD_D = 64
+    max_len_kv = 16384
 
-    SEQ_LEN_KVs = [1024, 2048, 4096, 8190, 32760]
-    SEQ_LEN_Qs = [1, 4]
-    BATCHs = [16, 32, 64, 128]
+    SEQ_LEN_KVs = [1024, 2048, 4096, 8192, 16384]
+    SEQ_LEN_Qs = [1] 
+    BATCHs = [512, 640]
 
     return [
         _Shape(
@@ -188,8 +213,31 @@ def _pack_xformer_input(
     )
 
     q = q.view(1, -1, head_q, head_d)
-    k = k.expand(-1, -1, head_q, -1).view(1, -1, head_q, k.shape[-1])
-    v = v.expand(-1, -1, head_q, -1).view(1, -1, head_q, v.shape[-1])
+    
+    # Handle GQA: expand KV heads to match Q heads
+    if head_kv == head_q:
+        # MHA case: no expansion needed
+        k = k.view(1, -1, head_q, k.shape[-1])
+        v = v.view(1, -1, head_q, v.shape[-1])
+    elif head_kv == 1:
+        # MQA case: broadcast single KV head
+        k = k.expand(-1, -1, head_q, -1).view(1, -1, head_q, k.shape[-1])
+        v = v.expand(-1, -1, head_q, -1).view(1, -1, head_q, v.shape[-1])
+    else:
+        # GQA case: repeat each KV head to match Q heads
+        # head_q must be divisible by head_kv
+        repeat_factor = head_q // head_kv
+        head_d = k.shape[-1]
+        #  q shape: [1, BT, head_kv, repeat_factor, head_d]
+        q = q.view(1, -1, head_kv, repeat_factor, head_d)
+        # k shape: [batch, max_len_kv, head_kv, head_d] 
+        k = k.view(1, -1, head_kv ,1, head_d).expand(
+            1, -1, head_kv, repeat_factor, head_d)
+        v = v.view(1, -1, head_kv ,1, head_d).expand(
+            1, -1, head_kv, repeat_factor, head_d)
+        # print(f"q shape: {q.shape}")
+        # print(f"k shape: {k.shape}")
+        # print(f"v shape: {v.shape}")
     return q, k, v, attn_bias
 
 
@@ -484,6 +532,32 @@ class Operator(BenchmarkOperator):
             op=fmha.triton_splitk.FwOp,
         ).view(q.shape)
 
+    @register_benchmark(enabled=HAS_MSLK_SPLITK and HAS_XFORMERS)
+    def triton_splitk_mslk(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+    ) -> Callable:
+        """Triton splitk implementation (with int64 fix from MSLK-NV)."""
+        from xformers.ops.fmha.common import Inputs
+        
+        _q, _k, _v, attn_bias = _pack_xformer_input(q, k_cache, v_cache, cache_seqlens)
+        
+        # Use get_splitk_4x to convert xformers attn_bias to mslk version
+        attn_op, splitk_attn_bias = get_splitk_4x(attn_bias)
+        
+        return lambda: fmha._memory_efficient_attention_forward(
+            Inputs(
+                query=_q,
+                key=_k,
+                value=_v,
+                attn_bias=splitk_attn_bias,
+            ),
+            op=attn_op,
+        ).view(q.shape)
+
     @register_benchmark(enabled=HAS_XFORMERS)
     def triton_splitk_fp8kv(
         self,
@@ -724,3 +798,32 @@ class Operator(BenchmarkOperator):
             k_scale_asm,
             v_scale_asm,
         )
+
+    @register_benchmark(enabled=HAS_MSLK_DECODE and IS_BLACKWELL)
+    def mslk_decode(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+    ) -> Callable:
+        """MSLK Triton/cute-DSL decode kernel (Blackwell optimized).
+
+        This is the FlashAttentionForwardSm100Decode kernel from the MSLK-NV repository,
+        which is a Triton/cute-DSL based decode kernel optimized for Blackwell architecture.
+        """
+        # MSLK decode kernel supports decode case (seq_len_q typically == 1, but can be > 1)
+        # The kernel expects q shape: (batch, seq_len_q, head_q, head_d)
+        # and k/v cache shape: (batch, max_len_kv, head_kv, head_d)
+
+        # Create seqlen_kv tensor for the kernel
+        seqlen_kv = cache_seqlens.to(dtype=torch.int32, device=q.device)
+
+        return lambda: mslk_flash_attn_decode(
+            q=q,
+            k=k_cache,
+            v=v_cache,
+            softmax_scale=None,  # Will use default 1/sqrt(head_dim)
+            causal=CAUSAL,
+            seqlen_kv=seqlen_kv,
+        )[0]  # Return only the output tensor, not lse
